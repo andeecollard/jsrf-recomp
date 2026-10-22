@@ -23,6 +23,7 @@
 #include "apu.h"
 #include "apu_sdl2.h"
 #include "apu_xaudio2.h"
+#include "apu_wav.h"
 #include "fpconv.h"
 
 /* ============================================================
@@ -214,106 +215,18 @@ typedef struct {
     int      frames_written;
 } WaveOutState;
 
-/* RECOMP_APU_WAV=<path> -- the mixed output, exactly as the backend receives it.
- *
- * We can now show that audio DELIVERY is healthy: 48,003 frames a second, zero
- * starvation, a queue that never drops below two device buffers, and an APU
- * frame gate shut for 0.05% of frames with a longest unbroken run of 10 ms.
- * None of that says the SAMPLES ARE RIGHT. A stale streaming buffer, a voice
- * left running past its loop point or a mis-decoded ADX block all produce a
- * perfectly punctual stream of wrong audio, and every counter above stays
- * green while it happens.
- *
- * So: tap the buffer at the point the backend is handed it, after the mixer
- * and after the mute check, and write a WAV. That is the artefact a person can
- * listen to, and the one a script can measure -- silence runs, discontinuities,
- * clipping -- without anybody having to be at the machine when it happens.
- *
- * Deliberately AFTER the backend selection would have happened but before it,
- * so the capture is identical whichever backend is live and exists even when
- * none is. Header is written with a placeholder length and patched on close;
- * if the process is killed (which is how every timed run ends) the sizes are
- * stale, so the reader is fixed up from the file length instead -- see
- * apu_wav_finish. A truncated capture is still worth having.
- *
- * Cost when unset: one pointer test per APU frame. */
 unsigned long long g_apu_out_frames;
-static FILE *g_apu_wav;
-static unsigned long g_apu_wav_frames;
 
-static void apu_wav_put32(FILE *f, uint32_t v)
-{
-    fputc((int)(v & 0xFF), f);        fputc((int)((v >> 8) & 0xFF), f);
-    fputc((int)((v >> 16) & 0xFF), f); fputc((int)((v >> 24) & 0xFF), f);
+/* Existing callers retain the JSRF capture finalizer. */
+void apu_wav_finish(void) { apu_wav_close(); }
+
+/* Diagnostics must describe the same flat-RAM resolver as the DMA helpers. */
+uint8_t *mcpx_apu_phys(uint64_t addr) { return g_apu_ram_ptr + (addr & g_apu_ram_mask); }
+const char *mcpx_apu_phys_class(uint64_t addr) { return addr > g_apu_ram_mask ? "wrap" : "ram"; }
+int apu_env_on(const char *name) {
+    const char *e = getenv(name);
+    return e && *e && *e != '0';
 }
-
-static void apu_wav_put16(FILE *f, uint16_t v)
-{
-    fputc((int)(v & 0xFF), f); fputc((int)((v >> 8) & 0xFF), f);
-}
-
-void apu_wav_finish(void)
-{
-    if (!g_apu_wav) return;
-    {
-        uint32_t data = (uint32_t)(g_apu_wav_frames * 4u);   /* 2ch * 16-bit */
-        fseek(g_apu_wav, 4, SEEK_SET);  apu_wav_put32(g_apu_wav, 36u + data);
-        fseek(g_apu_wav, 40, SEEK_SET); apu_wav_put32(g_apu_wav, data);
-    }
-    fclose(g_apu_wav);
-    g_apu_wav = NULL;
-    fprintf(stderr, "  [APU-WAV] closed, %lu frames (%.1f s)\n",
-            g_apu_wav_frames, g_apu_wav_frames / 48000.0);
-    fflush(stderr);
-}
-
-static void apu_wav_write(const int16_t *samples, int sample_frames)
-{
-    static int tried;
-    if (!tried) {
-        const char *path = getenv("RECOMP_APU_WAV");
-        tried = 1;
-        if (path && *path) {
-            g_apu_wav = fopen(path, "wb");
-            if (!g_apu_wav) { perror(path); return; }
-            fwrite("RIFF", 1, 4, g_apu_wav); apu_wav_put32(g_apu_wav, 0);
-            fwrite("WAVEfmt ", 1, 8, g_apu_wav); apu_wav_put32(g_apu_wav, 16);
-            apu_wav_put16(g_apu_wav, 1);        /* PCM */
-            apu_wav_put16(g_apu_wav, 2);        /* stereo */
-            apu_wav_put32(g_apu_wav, 48000);
-            apu_wav_put32(g_apu_wav, 48000 * 4);
-            apu_wav_put16(g_apu_wav, 4);
-            apu_wav_put16(g_apu_wav, 16);
-            fwrite("data", 1, 4, g_apu_wav); apu_wav_put32(g_apu_wav, 0);
-            fprintf(stderr, "  [APU-WAV] capturing the mixed output to %s\n", path);
-        }
-    }
-    if (!g_apu_wav || sample_frames <= 0) return;
-    fwrite(samples, 4, (size_t)sample_frames, g_apu_wav);
-    g_apu_wav_frames += (unsigned long)sample_frames;
-    /* Flushed periodically rather than at exit: a timed run is killed, not
-     * closed, so an unflushed tail is the part you wanted to hear. */
-    if ((g_apu_wav_frames % 48000u) < (unsigned long)sample_frames) {
-        /* Patch the two RIFF length fields before flushing, not only in
-         * apu_wav_finish. Every timed run here is killed rather than closed --
-         * measure.sh sends SIGTERM then SIGKILL -- so apu_wav_finish is never
-         * reached (it is one of twelve xbox_apu exports the link shows nothing
-         * references), and every capture taken today carried its placeholder
-         * zeros. Readers that trust the header, Python's `wave` among them,
-         * refuse the file outright, which is a silent tax on every audio
-         * measurement. Two seeks a second is nothing next to that. */
-        long pos = ftell(g_apu_wav);
-        if (pos > 44) {
-            fseek(g_apu_wav, 4, SEEK_SET);
-            apu_wav_put32(g_apu_wav, (uint32_t)(pos - 8));
-            fseek(g_apu_wav, 40, SEEK_SET);
-            apu_wav_put32(g_apu_wav, (uint32_t)(pos - 44));
-            fseek(g_apu_wav, pos, SEEK_SET);
-        }
-        fflush(g_apu_wav);
-    }
-}
-
 
 static WaveOutState g_waveout = { 0 };
 
@@ -323,6 +236,12 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.stream = NULL;
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
+
+    /* Retain the JSRF spelling as an alias for upstream's bounded WAV tap. */
+    const char *wav = getenv("RECOMP_AUDIO_WAV");
+    const char *secs = getenv("RECOMP_AUDIO_WAV_SECS");
+    if (!wav || !*wav) wav = getenv("RECOMP_APU_WAV");
+    if (wav && *wav) apu_wav_open(wav, secs ? atof(secs) : 0.0);
 
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
@@ -371,6 +290,7 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
 void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 {
+    apu_wav_close();
     (void)d;
     if (xa2_is_active()) {
         xa2_shutdown();

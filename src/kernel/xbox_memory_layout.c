@@ -26,6 +26,7 @@
 #endif
 
 #include "xbox_memory_layout.h"
+#include "apu/apu_wav.h"
 #include "xbox_usb_ohci.h"
 #include "kernel.h"
 #include "recomp_mem_watch.h"
@@ -3517,6 +3518,10 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
+    /* _exit skips atexit: finalise a RECOMP_AUDIO_WAV dump here, or up to
+     * its last second is past the header. Bounded, in case the frame
+     * thread is wedged inside a write. */
+    apu_wav_close_nowait(500);
     _exit(3);
     return 0;
 }

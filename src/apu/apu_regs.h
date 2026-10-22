@@ -334,6 +334,10 @@
 #define NUM_MIXBINS 32
 
 #define ADPCM_SAMPLES_PER_BLOCK 64 // FIXME: Should be 65? Check interpolation
+/* The largest samples-per-block value an ADPCM voice may use: the
+ * descriptor's field is 5 bits plus one. Sized for all of it, so no voice
+ * is refused (a refused stream voice never posts its SSL-done). */
+#define ADPCM_MAX_BLOCKS 32
 
 #define MCPX_HW_MAX_PRD_ENTRIES_PER_SSL     16
 #define MCPX_HW_SSLS_PER_VOICE              2

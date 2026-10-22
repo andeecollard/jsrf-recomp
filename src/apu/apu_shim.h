@@ -107,6 +107,9 @@ extern uint8_t *g_apu_ram_ptr; /* Set at init to point at guest RAM */
  * zeros while voice 68 at 0x00B30004 -- the one buffer that happens to live
  * low -- played correctly. Set from the real size at init. */
 extern uint32_t g_apu_ram_mask;
+uint8_t *mcpx_apu_phys(uint64_t addr);
+const char *mcpx_apu_phys_class(uint64_t addr);
+int apu_env_on(const char *name);
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
@@ -375,7 +378,7 @@ static struct {
 } g_config = {
     .audio = {
         .volume_limit = 1.0f,
-        .hrtf = false,
+        .hrtf = true,       /* xemu's default */
         .vp = { .num_workers = 1 },
     },
 };

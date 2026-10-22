@@ -6,6 +6,7 @@
 # Encode Processor (EP): Stub - direct mixbin passthrough
 
 add_library(xbox_apu STATIC
+    apu_wav.c
     apu_core.c
     apu_vp.c
     apu_dsp.c

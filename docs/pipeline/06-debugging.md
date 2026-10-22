@@ -348,3 +348,23 @@ This log becomes invaluable as the project progresses. Patterns emerge -- you'll
 ## The Payoff
 
 Debugging is the hardest part of static recompilation, but it's also the most rewarding. The moment the game transitions from a black screen with crashes to showing actual gameplay -- loading real assets, rendering the world, responding to input -- makes every hour of crash diagnosis worthwhile. And once you reach that point, progress accelerates dramatically because most of the foundational infrastructure is working.
+
+
+### JSRF APU diagnostics imported from upstream
+
+`RECOMP_AUDIO_WAV=<path>` records the mixed 48 kHz s16 stereo output;
+`RECOMP_AUDIO_WAV_SECS=<seconds>` caps the capture. The existing
+`RECOMP_APU_WAV` name remains an alias. Headers are refreshed during capture
+and finalized on shutdown; a forced kill can omit the last second.
+
+`RECOMP_APU_TRACE=1` reports per-voice format, sample address, RMS,
+zero-crossing rate and playback positions. `RECOMP_APU_VOICE_DUMP=<voice>`
+or `all` records fetched samples before gain; `RECOMP_APU_VOICE_DUMP_FILE`
+sets the path or per-voice filename prefix.
+
+`RECOMP_APU_RING=1` observes looping PCM buffers for repeated stale laps.
+A static looping effect is not classified as a stale stream until its
+contents have changed between laps. The diagnostics are off by default;
+`RECOMP_APU_TRACE=0` and `RECOMP_APU_RING=0` remain off. Existing JSRF host
+queue-depth, priming and starvation counters remain the output-side evidence:
+a continuous WAV alone does not prove continuous playback.

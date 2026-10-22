@@ -375,6 +375,8 @@ typedef struct MCPXAPUVoiceFilter {
     SRC_STATE *resampler;
     sv_filter svf[2];
     HrtfFilter hrtf;
+    float gain_prev[8];
+    bool gain_valid;
 } MCPXAPUVoiceFilter;
 
 typedef struct VoiceWorkItem {
@@ -414,7 +416,8 @@ typedef struct MCPXAPUVPState {
     uint8_t hrtf_submix[4];
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
-    uint64_t voice_locked[4];
+    volatile uint8_t voice_locked[MCPX_HW_MAX_VOICES];
+    volatile LONG voice_spin[MCPX_HW_MAX_VOICES];   /* see voice_spin_lock */
 
     struct {
         int current_entry;
