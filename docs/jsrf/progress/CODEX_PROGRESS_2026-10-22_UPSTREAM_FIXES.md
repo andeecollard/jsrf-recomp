@@ -1,5 +1,17 @@
 # Discovery, lifter and APU integration — 22 October 2026
 
+## Baseline correction after launching the Mac app
+
+This is an experimental integration on the older September 15 source,
+not an update to the working Mac app. The maintained source is
+`4242eb6` in `/Users/andrewcollard/jsrf/xboxrecomp_upstream_integration`;
+the user confirmed the existing `/Users/andrewcollard/jsrf-build/JSRF.app`
+works well after it was launched instead of this branch's diagnostic build.
+That maintained source already has the FRNDINT fix and newer Direct3D and
+DSOUND lifts. Any remaining useful changes here need selective integration
+and validation against that source before updating the app. The validation
+below applies only to this older experimental baseline.
+
 Base: `935117f` (`accuracy-gaps-and-gameplay-harness`, including the nine
 local commits ahead of the remote). Upstream reference: `f0f8a46`, v0.16.0.
 Work is isolated on `codex/jsrf-discovery-lifter-apu` in the scratch clone
